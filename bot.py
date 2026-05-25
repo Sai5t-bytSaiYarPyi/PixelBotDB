@@ -65,121 +65,169 @@ pending_admin_actions: dict = {}
 # ══════════════════════════════════════════════════════
 #  DATABASE + AUTO-MIGRATION
 # ══════════════════════════════════════════════════════
-def init_db():
-    with sqlite3.connect(DB) as c:
-        c.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                uid INTEGER PRIMARY KEY, username TEXT,
-                name TEXT, points INTEGER DEFAULT 0, joined TEXT
-            );
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, 
-                plan_id TEXT, plan_name TEXT, pts INTEGER, gmail TEXT, 
-                password TEXT, twofa TEXT, status TEXT DEFAULT 'pending', ts TEXT
-            );
-            CREATE TABLE IF NOT EXISTS pt_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, 
-                pts INTEGER, price INTEGER, screenshot TEXT, note TEXT DEFAULT '',
-                status TEXT DEFAULT 'pending', ts TEXT
-            );
-            CREATE TABLE IF NOT EXISTS manual_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, 
-                note TEXT, status TEXT DEFAULT 'pending', ts TEXT
-            );
-            CREATE TABLE IF NOT EXISTS waitlist (uid INTEGER PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT);
-        """)
-        # Initialize away mode if not exists
-        c.execute("INSERT OR IGNORE INTO settings (key, val) VALUES ('admin_away', '0')")
-    logging.info("✅ DB Initialized")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def _db(): return sqlite3.connect(DB)
+def _db():
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True  # Auto save data
+    return conn
+
+def init_db():
+    try:
+        with _db() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        uid BIGINT PRIMARY KEY, username TEXT,
+                        name TEXT, points INTEGER DEFAULT 0, joined TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS orders (
+                        id SERIAL PRIMARY KEY, uid BIGINT, 
+                        plan_id TEXT, plan_name TEXT, pts INTEGER, gmail TEXT, 
+                        password TEXT, twofa TEXT, status TEXT DEFAULT 'pending', ts TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS pt_requests (
+                        id SERIAL PRIMARY KEY, uid BIGINT, 
+                        pts INTEGER, price INTEGER, screenshot TEXT, note TEXT DEFAULT '',
+                        status TEXT DEFAULT 'pending', ts TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS manual_requests (
+                        id SERIAL PRIMARY KEY, uid BIGINT, 
+                        note TEXT, status TEXT DEFAULT 'pending', ts TEXT
+                    );
+                    CREATE TABLE IF NOT EXISTS waitlist (uid BIGINT PRIMARY KEY);
+                    CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, val TEXT);
+                """)
+                # Initialize away mode if not exists
+                c.execute("""
+                    INSERT INTO settings (key, val) VALUES ('admin_away', '0')
+                    ON CONFLICT (key) DO NOTHING;
+                """)
+        logging.info("✅ PostgreSQL DB Initialized Successfully")
+    except Exception as e:
+        logging.error(f"❌ Database Initialization Error: {e}")
+
 def now(): return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 def ts_fmt(ts): return ts[:16] if ts else "-"
 
 # --- Settings & Waitlist Functions ---
 def get_away_mode() -> bool:
-    with _db() as c:
-        r = c.execute("SELECT val FROM settings WHERE key='admin_away'").fetchone()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT val FROM settings WHERE key='admin_away'")
+        r = c.fetchone()
         return r[0] == '1' if r else False
 
 def set_away_mode(state: bool):
-    with _db() as c:
-        c.execute("UPDATE settings SET val=? WHERE key='admin_away'", ('1' if state else '0',))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("UPDATE settings SET val=%s WHERE key='admin_away'", ('1' if state else '0',))
 
 def add_waitlist(uid):
-    with _db() as c:
-        c.execute("INSERT OR IGNORE INTO waitlist (uid) VALUES (?)", (uid,))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("INSERT INTO waitlist (uid) VALUES (%s) ON CONFLICT (uid) DO NOTHING", (uid,))
 
 def get_waitlist():
-    with _db() as c:
-        return [r[0] for r in c.execute("SELECT uid FROM waitlist").fetchall()]
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT uid FROM waitlist")
+        return [r[0] for r in c.fetchall()]
 
 def clear_waitlist():
-    with _db() as c:
+    with _db() as conn, conn.cursor() as c:
         c.execute("DELETE FROM waitlist")
 
 # --- User & Order Functions ---
 def ensure_user(uid, username, name):
-    with _db() as c:
-        c.execute("INSERT OR IGNORE INTO users VALUES(?,?,?,0,?)", (uid, username, name, now()))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("""
+            INSERT INTO users (uid, username, name, points, joined) 
+            VALUES (%s, %s, %s, 0, %s) 
+            ON CONFLICT (uid) DO NOTHING
+        """, (uid, username, name, now()))
 
 def get_pts(uid):
-    with _db() as c:
-        r = c.execute("SELECT points FROM users WHERE uid=?", (uid,)).fetchone()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT points FROM users WHERE uid=%s", (uid,))
+        r = c.fetchone()
     return r[0] if r else 0
 
 def get_user_info(uid):
-    with _db() as c:
-        return c.execute("SELECT uid,username,name,points FROM users WHERE uid=?", (uid,)).fetchone()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT uid, username, name, points FROM users WHERE uid=%s", (uid,))
+        return c.fetchone()
 
 def add_pts(uid, n):
-    with _db() as c:
-        c.execute("UPDATE users SET points=points+? WHERE uid=?", (n, uid))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("UPDATE users SET points=points+%s WHERE uid=%s", (n, uid))
 
 def new_order(uid, plan_id, plan_name, pts, gmail, pwd, twofa):
-    with _db() as c:
-        cur = c.execute(
-            "INSERT INTO orders(uid,plan_id,plan_name,pts,gmail,password,twofa,ts) VALUES(?,?,?,?,?,?,?,?)",
-            (uid, plan_id, plan_name, pts, gmail, pwd, twofa, now()))
-        return cur.lastrowid
+    with _db() as conn, conn.cursor() as c:
+        c.execute("""
+            INSERT INTO orders(uid, plan_id, plan_name, pts, gmail, password, twofa, ts) 
+            VALUES(%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+        """, (uid, plan_id, plan_name, pts, gmail, pwd, twofa, now()))
+        return c.fetchone()[0]
 
 def get_order(oid):
-    with _db() as c: return c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT * FROM orders WHERE id=%s", (oid,))
+        return c.fetchone()
 
 def set_order_status(oid, status):
-    with _db() as c: c.execute("UPDATE orders SET status=? WHERE id=?", (status, oid))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("UPDATE orders SET status=%s WHERE id=%s", (status, oid))
 
 def my_orders(uid):
-    with _db() as c:
-        return c.execute("SELECT id,plan_name,pts,status,ts FROM orders WHERE uid=? ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT id, plan_name, pts, status, ts FROM orders WHERE uid=%s ORDER BY id DESC LIMIT 10", (uid,))
+        return c.fetchall()
 
 def new_pt_req(uid, pts, price, fid):
-    with _db() as c:
-        return c.execute("INSERT INTO pt_requests(uid,pts,price,screenshot,ts) VALUES(?,?,?,?,?)", (uid, pts, price, fid, now())).lastrowid
+    with _db() as conn, conn.cursor() as c:
+        c.execute("""
+            INSERT INTO pt_requests(uid, pts, price, screenshot, ts) 
+            VALUES(%s, %s, %s, %s, %s) RETURNING id
+        """, (uid, pts, price, fid, now()))
+        return c.fetchone()[0]
 
 def set_pt_status(rid, status):
-    with _db() as c: c.execute("UPDATE pt_requests SET status=? WHERE id=?", (status, rid))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("UPDATE pt_requests SET status=%s WHERE id=%s", (status, rid))
 
 def pending_orders():
-    with _db() as c: return c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id DESC").fetchall()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT * FROM orders WHERE status='pending' ORDER BY id DESC")
+        return c.fetchall()
 
 def pending_pts():
-    with _db() as c: return c.execute("SELECT * FROM pt_requests WHERE status='pending' ORDER BY id DESC").fetchall()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT * FROM pt_requests WHERE status='pending' ORDER BY id DESC")
+        return c.fetchall()
 
 def all_pt_requests(limit=30):
-    with _db() as c:
-        return c.execute("SELECT r.id,r.uid,u.name,r.pts,r.price,r.status,r.ts FROM pt_requests r LEFT JOIN users u ON r.uid=u.uid ORDER BY r.id DESC LIMIT ?", (limit,)).fetchall()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("""
+            SELECT r.id, r.uid, u.name, r.pts, r.price, r.status, r.ts 
+            FROM pt_requests r LEFT JOIN users u ON r.uid=u.uid 
+            ORDER BY r.id DESC LIMIT %s
+        """, (limit,))
+        return c.fetchall()
 
 def pending_manual_reqs():
-    with _db() as c:
-        return c.execute("SELECT m.id,m.uid,u.name,u.points,m.note,m.ts FROM manual_requests m LEFT JOIN users u ON m.uid=u.uid WHERE m.status='pending' ORDER BY m.id DESC").fetchall()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("""
+            SELECT m.id, m.uid, u.name, u.points, m.note, m.ts 
+            FROM manual_requests m LEFT JOIN users u ON m.uid=u.uid 
+            WHERE m.status='pending' ORDER BY m.id DESC
+        """)
+        return c.fetchall()
 
 def set_manual_status(mid, status):
-    with _db() as c: c.execute("UPDATE manual_requests SET status=? WHERE id=?", (status, mid))
+    with _db() as conn, conn.cursor() as c:
+        c.execute("UPDATE manual_requests SET status=%s WHERE id=%s", (status, mid))
 
 def all_users():
-    with _db() as c: return c.execute("SELECT uid,username,name,points FROM users").fetchall()
+    with _db() as conn, conn.cursor() as c:
+        c.execute("SELECT uid, username, name, points FROM users")
+        return c.fetchall()
 
 # ══════════════════════════════════════════════════════
 #  KEYBOARDS
